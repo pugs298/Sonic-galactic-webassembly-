@@ -1,0 +1,212 @@
+diff -ruN a/cmake/Platforms/Emscripten.cmake b/cmake/Platforms/Emscripten.cmake
+--- a/cmake/Platforms/Emscripten.cmake	1970-01-01 00:00:00.000000000 +0000
++++ b/cmake/Platforms/Emscripten.cmake	2026-11-13 11:23:02.978571195 +0000
+@@ -0,0 +1,45 @@
++# Emscripten / WebAssembly platform file for Hatch Game Engine.
++# Selected automatically when configuring with the Emscripten toolchain
++# (CMAKE_SYSTEM_NAME == "Emscripten"), i.e. `emcmake cmake ...`.
++
++add_executable(${PROJECT_NAME} ${HATCH_SOURCES})
++target_compile_definitions(${PROJECT_NAME} PRIVATE -DHATCH_WEB)
++
++# Not available in this build:
++#  - The desktop OpenGL renderer (GLEW, GLSL 120/130, compatibility profile)
++#    can't run on WebGL. Without USING_OPENGL the engine falls back to its
++#    SDL2 renderer, which SDL maps to WebGL for us.
++#  - Open Asset Import Library, linenoise, Discord and libcurl are skipped.
++set(USING_OPENGL OFF CACHE BOOL "Use OpenGL" FORCE)
++set(USE_OPEN_ASSET_IMPORT_LIBRARY OFF CACHE BOOL "Use Open Asset Import Library" FORCE)
++
++set(CMAKE_EXECUTABLE_SUFFIX ".js")
++
++set(HATCH_WEB_COMMON_FLAGS
++  -sUSE_SDL=2
++  -fwasm-exceptions
++)
++
++set(HATCH_WEB_LINK_FLAGS
++  ${HATCH_WEB_COMMON_FLAGS}
++  # Memory: Data.hatch lives in the JS-side MEMFS, not in wasm memory, so the
++  # wasm heap only needs room for the engine, decoded textures and audio.
++  -sALLOW_MEMORY_GROWTH=1
++  -sINITIAL_MEMORY=268435456
++  -sMAXIMUM_MEMORY=2147483648
++  -sSTACK_SIZE=5242880
++  # Virtual filesystem (Data.hatch in MEMFS, saves/settings in IDBFS).
++  -sFORCE_FILESYSTEM=1
++  -lidbfs.js
++  -sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency
++  # One self-contained .js (wasm embedded as base64) that pack.py inlines
++  # into a single .html file.
++  -sSINGLE_FILE=1
++  -sMODULARIZE=1
++  -sEXPORT_NAME=createHatchModule
++  -sENVIRONMENT=web
++  -sEXIT_RUNTIME=0
++)
++
++target_compile_options(${PROJECT_NAME} PRIVATE ${HATCH_WEB_COMMON_FLAGS})
++target_link_options(${PROJECT_NAME} PRIVATE ${HATCH_WEB_LINK_FLAGS})
+diff -ruN a/source/Engine/Application.cpp b/source/Engine/Application.cpp
+--- a/source/Engine/Application.cpp	2026-11-13 11:23:02.952043024 +0000
++++ b/source/Engine/Application.cpp	2026-11-13 11:23:02.965589609 +0000
+@@ -46,6 +46,11 @@
+ #include <windows.h>
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#include <emscripten/html5.h>
++#endif
++
+ #define DEFAULT_MAX_FRAMESKIP 15
+ 
+ #if WIN32
+@@ -2031,6 +2036,10 @@
+ 	}
+ }
+ void Application::DelayFrame() {
++#ifdef __EMSCRIPTEN__
++	// Pacing is handled in WebMainLoopCallback; blocking here would freeze the tab.
++	return;
++#endif
+ 	double frameTime = Clock::GetTicks() - FrameTimeStart;
+ 	double frameDurationRemainder = FrameTimeDesired - frameTime;
+ 	if (frameDurationRemainder >= 0.0) {
+@@ -2090,6 +2099,48 @@
+ 		Scene::FinishLoad();
+ 	}
+ }
++#ifdef __EMSCRIPTEN__
++static double WebFrameAccumulator = 0.0;
++static double WebLastRAF = 0.0;
++
++// Called by requestAnimationFrame. Display refresh rates vary (60/120/144Hz),
++// so only run a game frame once enough time has accumulated for one frame at
++// the engine's target FPS. Otherwise the game would run too fast on
++// high-refresh displays.
++void Application::WebMainLoopCallback(void* userData) {
++	double now = Clock::GetTicks();
++	double elapsed = now - WebLastRAF;
++	WebLastRAF = now;
++
++	// Don't build up a huge backlog after the tab was in the background.
++	if (elapsed > FrameTimeDesired * 4.0) {
++		elapsed = FrameTimeDesired;
++	}
++
++	WebFrameAccumulator += elapsed;
++
++	// 1.5ms of slack so a 60Hz display against a 60 FPS target isn't
++	// randomly dropping frames due to timer jitter.
++	if (WebFrameAccumulator < FrameTimeDesired - 1.5) {
++		return;
++	}
++	WebFrameAccumulator -= FrameTimeDesired;
++	if (WebFrameAccumulator > FrameTimeDesired) {
++		WebFrameAccumulator = 0.0;
++	}
++
++	if (Running) {
++		MainLoopCallback(NULL);
++	}
++
++	if (!Running) {
++		emscripten_cancel_main_loop();
++		EndGame();
++		Cleanup();
++	}
++}
++#endif
++
+ void Application::Run(int argc, char* args[]) {
+ 	Application::Init(argc, args);
+ 	if (!Running) {
+@@ -2121,6 +2172,14 @@
+ 	// Set up the game to run in the window animation callback on
+ 	// iOS so that Game Center and so forth works correctly.
+ 	SDL_iPhoneSetAnimationCallback(Application::Window, 1, MainLoopCallback, NULL);
++#elif defined(__EMSCRIPTEN__)
++	// The browser owns the event loop, so MainLoop() must be driven by
++	// requestAnimationFrame instead of a blocking while loop.
++	LastTick = Clock::GetTicks();
++	WebFrameAccumulator = 0.0;
++	WebLastRAF = LastTick;
++
++	emscripten_set_main_loop_arg(WebMainLoopCallback, NULL, 0, 1);
+ #else
+ 	LastTick = Clock::GetTicks();
+ 
+diff -ruN a/source/Engine/Application.h b/source/Engine/Application.h
+--- a/source/Engine/Application.h	2026-11-13 11:23:02.952118751 +0000
++++ b/source/Engine/Application.h	2026-11-13 11:23:02.965650350 +0000
+@@ -70,6 +70,9 @@
+ 	static void RunFrame(int runFrames);
+ 	static void MainLoop();
+ 	static void MainLoopCallback(void* p);
++#ifdef __EMSCRIPTEN__
++	static void WebMainLoopCallback(void* userData);
++#endif
+ 	static void TakeScreenshotCallback(OperationResult result);
+ 	static void DrawPerformance();
+ 	static void DrawPaletteViewer();
+diff -ruN a/source/Engine/Bytecode/StandardLibrary.cpp b/source/Engine/Bytecode/StandardLibrary.cpp
+--- a/source/Engine/Bytecode/StandardLibrary.cpp	2026-11-13 11:23:02.952766433 +0000
++++ b/source/Engine/Bytecode/StandardLibrary.cpp	2026-11-13 11:23:02.966291645 +0000
+@@ -8033,12 +8033,16 @@
+ 	strcpy(bundle->url, url);
+ 	strcpy(bundle->filename, filename);
+ 
++#ifdef __EMSCRIPTEN__
++	_HTTP_GetToFile(bundle);
++#else
+ 	if (blocking) {
+ 		_HTTP_GetToFile(bundle);
+ 	}
+ 	else {
+ 		SDL_CreateThread(_HTTP_GetToFile, "HTTP.GetToFile", bundle);
+ 	}
++#endif
+ 	return NULL_VAL;
+ }
+ // #endregion
+@@ -19047,7 +19051,13 @@
+ 	}
+ 
+ 	// SDL_DetachThread
++#ifdef __EMSCRIPTEN__
++	// A single-file web build can't use pthreads (no SharedArrayBuffer without
++	// cross-origin isolation), so run the event synchronously.
++	_Thread_RunEvent(bundle);
++#else
+ 	SDL_CreateThread(_Thread_RunEvent, "_Thread_RunEvent", bundle);
++#endif
+ 
+ 	return NULL_VAL;
+ }
+diff -ruN a/source/Engine/Filesystem/Path.cpp b/source/Engine/Filesystem/Path.cpp
+--- a/source/Engine/Filesystem/Path.cpp	2026-11-13 11:23:02.955597905 +0000
++++ b/source/Engine/Filesystem/Path.cpp	2026-11-13 11:23:02.968479848 +0000
+@@ -258,6 +258,9 @@
+ std::string Path::GetBasePath() {
+ #ifdef CONSOLE_FILESYSTEM
+ 	return GetConsoleBasePath();
++#elif defined(__EMSCRIPTEN__)
++	// The page's JS shell places Data.hatch at the root of the virtual FS.
++	return "/";
+ #else
+ 	char* basePath = SDL_GetBasePath();
+ 	if (basePath == nullptr) {
+diff -ruN a/source/Engine/Includes/StandardSDL2.h b/source/Engine/Includes/StandardSDL2.h
+--- a/source/Engine/Includes/StandardSDL2.h	2026-11-13 11:23:02.956978425 +0000
++++ b/source/Engine/Includes/StandardSDL2.h	2026-11-13 11:23:02.969908827 +0000
+@@ -22,6 +22,9 @@
+ #elif LINUX
+ // SDL2 includes
+ #include <SDL.h>
++#elif defined(__EMSCRIPTEN__)
++// SDL2 includes (provided by -sUSE_SDL=2)
++#include <SDL.h>
+ #endif
+ 
+ typedef uint32_t uint;

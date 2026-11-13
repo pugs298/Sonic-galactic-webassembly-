@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Sonic Galactic (Hatch Game Engine, WebAssembly)</title>
+<style>
+:root { --bg:#0e1116; --fg:#e8ecf2; --muted:#98a2b3; --accent:#4c8dff; --panel:#161b22; --line:#2a313c; }
+@media (prefers-color-scheme: light) {
+  :root { --bg:#f4f6fa; --fg:#14181f; --muted:#5b6575; --accent:#1f5fe0; --panel:#ffffff; --line:#d5dbe5; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+#app { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px; }
+#stage { position: fixed; inset: 0; background: #000; display: none; }
+#canvas { width: 100%; height: 100%; display: block; outline: none; object-fit: contain; }
+#panel { width: min(560px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+p { margin: 8px 0; color: var(--muted); }
+button, label.btn { appearance: none; border: 0; border-radius: 10px; background: var(--accent); color: #fff;
+  font: inherit; font-weight: 600; padding: 11px 18px; cursor: pointer; display: inline-block; }
+button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+button[disabled] { opacity: .5; cursor: default; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+#bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 14px; display: none; }
+#bar > i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .15s; }
+#status { margin-top: 10px; font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
+#log { display: none; margin-top: 12px; max-height: 160px; overflow: auto; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+  background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; white-space: pre-wrap; }
+#fs, #logbtn { position: absolute; top: 8px; opacity: 0; transition: opacity .2s; padding: 6px 10px; font-size: 12px;
+  background: rgba(20,24,31,.75); color: #fff; border: 1px solid rgba(255,255,255,.25); }
+#fs { right: 8px; } #logbtn { right: 100px; }
+#stage:hover #fs, #stage:hover #logbtn { opacity: .85; }
+#log.overlay { position: fixed; left: 10px; right: 10px; bottom: 10px; max-height: 40vh; z-index: 10; background: rgba(10,12,16,.92); color: #d7dde8; }
+input[type=file] { display: none; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="panel">
+    <h1>Sonic Galactic <small style="font-weight:400;color:var(--muted)">· Hatch Game Engine in WebAssembly</small></h1>
+    <p>This page contains the engine only. Pick your own <b>Data.hatch</b> from your copy of the game once; it is kept in this browser (IndexedDB) so you won't need to pick it again.</p>
+    <div class="row">
+      <label class="btn" for="pick">Choose Data.hatch…</label>
+      <input id="pick" type="file" accept=".hatch">
+      <button id="start" disabled>Start</button>
+      <button id="forget" class="secondary" style="display:none">Forget stored data</button>
+    </div>
+    <div id="bar"><i></i></div>
+    <div id="status">Checking for a stored Data.hatch…</div>
+    <div id="log"></div>
+  </div>
+  <div id="stage">
+    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+    <button id="logbtn" class="secondary">Log</button>
+    <button id="fs" class="secondary">Fullscreen</button>
+  </div>
+</div>
+
+<script>
+/*__HATCH_MODULE_JS__*/
+</script>
+
+<script>
+(function () {
+  "use strict";
+  var DB_NAME = "hatch-web", STORE = "files", KEY = "Data.hatch";
+  var $ = function (id) { return document.getElementById(id); };
+  var pickEl = $("pick"), startEl = $("start"), forgetEl = $("forget");
+  var statusEl = $("status"), barEl = $("bar"), logEl = $("log");
+  var blob = null, started = false, savingTimer = null;
+
+  function setStatus(t) { statusEl.textContent = t; }
+  function appendLog(t) { logEl.style.display = "block"; logEl.textContent += t + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+  function progress(f) { barEl.style.display = "block"; barEl.firstElementChild.style.width = Math.round(f * 100) + "%"; }
+  function mb(n) { return (n / 1048576).toFixed(0) + " MB"; }
+
+  // ---- IndexedDB cache for the user's Data.hatch -------------------------
+  function idb() {
+    return new Promise(function (res, rej) {
+      var r; try { r = indexedDB.open(DB_NAME, 1); } catch (e) { return rej(e); }
+      r.onupgradeneeded = function () { r.result.createObjectStore(STORE); };
+      r.onsuccess = function () { res(r.result); };
+      r.onerror = function () { rej(r.error); };
+    });
+  }
+  function idbGet() {
+    return idb().then(function (db) {
+      return new Promise(function (res, rej) {
+        var q = db.transaction(STORE).objectStore(STORE).get(KEY);
+        q.onsuccess = function () { res(q.result || null); };
+        q.onerror = function () { rej(q.error); };
+      });
+    });
+  }
+  function idbPut(b) {
+    return idb().then(function (db) {
+      return new Promise(function (res, rej) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).put(b, KEY);
+        tx.oncomplete = function () { res(); };
+        tx.onerror = function () { rej(tx.error); };
+        tx.onabort = function () { rej(tx.error); };
+      });
+    });
+  }
+  function idbDelete() {
+    return idb().then(function (db) {
+      return new Promise(function (res, rej) {
+        var tx = db.transaction(STORE, "readwrite");
+        tx.objectStore(STORE).delete(KEY);
+        tx.oncomplete = function () { res(); };
+        tx.onerror = function () { rej(tx.error); };
+      });
+    });
+  }
+
+  function ready(b, fromCache) {
+    blob = b;
+    startEl.disabled = false;
+    forgetEl.style.display = "inline-block";
+    setStatus((fromCache ? "Stored Data.hatch found" : "Selected") + " (" + mb(b.size) + "). Press Start.");
+  }
+
+  // ---- Boot -------------------------------------------------------------
+  function embeddedBlob() {
+    var b64 = window.__EMBEDDED_DATA_HATCH__;
+    if (!b64) return null;
+    var bin = atob(b64), u8 = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+    window.__EMBEDDED_DATA_HATCH__ = null;
+    return new Blob([u8]);
+  }
+  var emb = embeddedBlob();
+  if (emb) {
+    ready(emb, false);
+    setStatus("Game data is embedded in this page (" + mb(emb.size) + "). Press Start.");
+  } else {
+    idbGet().then(function (b) {
+      if (b && b.size > 0) ready(b, true); else setStatus("No stored Data.hatch yet. Choose your file to begin.");
+    }).catch(function () {
+      setStatus("Choose your Data.hatch to begin. (Browser storage unavailable; you'll need to pick it each visit.)");
+    });
+  }
+
+  pickEl.addEventListener("change", function () {
+    var f = pickEl.files && pickEl.files[0];
+    if (!f) return;
+    ready(f, false);
+    idbPut(f).then(function () { setStatus("Selected and stored (" + mb(f.size) + "). Press Start."); },
+                   function () { /* quota or private mode: still usable this session */ });
+  });
+  forgetEl.addEventListener("click", function () {
+    idbDelete().then(function () { blob = null; startEl.disabled = true; forgetEl.style.display = "none"; setStatus("Stored data removed."); });
+  });
+  $("logbtn").addEventListener("click", function () {
+    logEl.classList.add("overlay");
+    logEl.style.display = logEl.style.display === "block" ? "none" : "block";
+  });
+  $("fs").addEventListener("click", function () {
+    var s = $("stage"); (s.requestFullscreen || s.webkitRequestFullscreen).call(s);
+  });
+
+  // ---- Read the blob in chunks so we never hold two full copies ----------
+  function readBlob(b) {
+    return new Promise(function (resolve, reject) {
+      var out = new Uint8Array(b.size), off = 0;
+      var reader = b.stream().getReader();
+      (function pump() {
+        reader.read().then(function (r) {
+          if (r.done) return resolve(out);
+          out.set(r.value, off); off += r.value.length;
+          progress(off / b.size);
+          pump();
+        }, reject);
+      })();
+    });
+  }
+
+  var FSRef = null, syncing = false;
+  function persist() {
+    if (!FSRef || syncing) return;
+    syncing = true;
+    try {
+      FSRef.syncfs(false, function (err) { syncing = false; if (err) appendLog("Save sync failed: " + err); });
+    } catch (e) { syncing = false; }
+  }
+
+  startEl.addEventListener("click", function () {
+    if (started || !blob) return;
+    if (typeof createHatchModule !== "function") {
+      setStatus("This page has no engine inside it. Build it with build.sh (see README) so the WebAssembly module gets embedded.");
+      return;
+    }
+    started = true; startEl.disabled = true; pickEl.disabled = true; forgetEl.disabled = true;
+    setStatus("Loading Data.hatch into memory…");
+    readBlob(blob).then(function (bytes) {
+      setStatus("Starting engine…");
+      return createHatchModule({
+        canvas: $("canvas"),
+        print: function (t) { console.log(t); appendLog(t); },
+        printErr: function (t) { console.warn(t); appendLog(t); },
+        preRun: [function (M) {
+          var FS = M.FS;
+          FSRef = FS;
+          // The engine resolves game://Data.hatch to /Data.hatch.
+          // canOwn=true keeps the ArrayBuffer as the file's storage (no second copy).
+          FS.createDataFile("/", "Data.hatch", bytes, true, false, true);
+          // SDL_GetPrefPath() resolves under /libsdl/ -> persistent settings and saves.
+          FS.mkdir("/libsdl");
+          FS.mount(FS.filesystems.IDBFS, {}, "/libsdl");
+          M.addRunDependency("idbfs-load");
+          FS.syncfs(true, function (err) {
+            if (err) appendLog("Could not load saved data: " + err);
+            M.removeRunDependency("idbfs-load");
+          });
+        }],
+        onAbort: function (what) { appendLog("Engine aborted: " + what); }
+      });
+    }).then(function () {
+      $("panel").style.display = "none";
+      $("stage").style.display = "block";
+      $("canvas").focus();
+      setInterval(persist, 4000);
+      document.addEventListener("visibilitychange", function () { if (document.hidden) persist(); });
+      window.addEventListener("pagehide", persist);
+    }, function (e) {
+      started = false; startEl.disabled = false; pickEl.disabled = false; forgetEl.disabled = false;
+      setStatus("Failed to start: " + (e && e.message || e)); appendLog(String(e && e.stack || e));
+    });
+  });
+})();
+</script>
+</body>
+</html>
