@@ -18,6 +18,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check uploaded files
+        run: |
+          # Expected sizes: hatch-emscripten.patch ~7123, pack.py ~1741, index.template.html ~10733 bytes
+          for f in hatch-emscripten.patch pack.py index.template.html; do
+            if [ ! -s "$f" ]; then
+              echo "::error::$f is missing or empty - delete it and upload or paste it again"
+              exit 1
+            fi
+            echo "$f: $(wc -c < "$f") bytes"
+          done
+
       - uses: mymindstorm/setup-emsdk@v14
         with:
           version: 3.1.74
@@ -29,6 +40,8 @@ jobs:
         run: |
           cd engine
           patch -p1 --fuzz=3 < ../hatch-emscripten.patch
+          test -f cmake/Platforms/Emscripten.cmake || { echo "::error::patch did not create cmake/Platforms/Emscripten.cmake"; exit 1; }
+          grep -q __EMSCRIPTEN__ source/Engine/Application.cpp || { echo "::error::patch did not change Application.cpp"; exit 1; }
 
       - name: Build (WebAssembly)
         run: |
