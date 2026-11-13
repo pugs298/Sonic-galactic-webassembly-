@@ -31,7 +31,10 @@ button[disabled] { opacity: .5; cursor: default; }
 #fs, #logbtn { position: absolute; top: 8px; opacity: 0; transition: opacity .2s; padding: 6px 10px; font-size: 12px;
   background: rgba(20,24,31,.75); color: #fff; border: 1px solid rgba(255,255,255,.25); }
 #fs { right: 8px; } #logbtn { right: 100px; }
-#stage:hover #fs, #stage:hover #logbtn { opacity: .85; }
+#copylog { position: absolute; top: 8px; right: 168px; opacity: 0; transition: opacity .2s; padding: 6px 10px; font-size: 12px;
+  background: rgba(20,24,31,.75); color: #fff; border: 1px solid rgba(255,255,255,.25); }
+#stage:hover #fs, #stage:hover #logbtn, #stage:hover #copylog { opacity: .85; }
+@media (hover: none) { #fs, #logbtn, #copylog { opacity: .85; } }
 #log.overlay { position: fixed; left: 10px; right: 10px; bottom: 10px; max-height: 40vh; z-index: 10; background: rgba(10,12,16,.92); color: #d7dde8; }
 input[type=file] { display: none; }
 </style>
@@ -53,6 +56,7 @@ input[type=file] { display: none; }
   </div>
   <div id="stage">
     <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+    <button id="copylog" class="secondary">Copy log</button>
     <button id="logbtn" class="secondary">Log</button>
     <button id="fs" class="secondary">Fullscreen</button>
   </div>
@@ -72,7 +76,14 @@ input[type=file] { display: none; }
   var blob = null, started = false, savingTimer = null;
 
   function setStatus(t) { statusEl.textContent = t; }
-  function appendLog(t) { logEl.style.display = "block"; logEl.textContent += t + "\n"; logEl.scrollTop = logEl.scrollHeight; }
+  var fullLog = "";
+  function appendLog(t) {
+    fullLog += t + "\n";
+    if (fullLog.length > 200000) fullLog = fullLog.slice(-150000);
+    logEl.textContent = fullLog.length > 20000 ? "...\n" + fullLog.slice(-20000) : fullLog;
+    logEl.scrollTop = logEl.scrollHeight;
+    if (!started) logEl.style.display = "block";
+  }
   function progress(f) { barEl.style.display = "block"; barEl.firstElementChild.style.width = Math.round(f * 100) + "%"; }
   function mb(n) { return (n / 1048576).toFixed(0) + " MB"; }
 
@@ -153,6 +164,18 @@ input[type=file] { display: none; }
   });
   forgetEl.addEventListener("click", function () {
     idbDelete().then(function () { blob = null; startEl.disabled = true; forgetEl.style.display = "none"; setStatus("Stored data removed."); });
+  });
+  $("copylog").addEventListener("click", function () {
+    var btn = $("copylog"), txt = fullLog || "(log is empty)";
+    function done(ok) { btn.textContent = ok ? "Copied" : "Copy failed"; setTimeout(function () { btn.textContent = "Copy log"; }, 1500); }
+    try {
+      navigator.clipboard.writeText(txt).then(function () { done(true); }, function () { done(false); });
+    } catch (e) {
+      try {
+        var ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta);
+        ta.select(); var ok = document.execCommand("copy"); document.body.removeChild(ta); done(ok);
+      } catch (e2) { done(false); }
+    }
   });
   $("logbtn").addEventListener("click", function () {
     logEl.classList.add("overlay");
