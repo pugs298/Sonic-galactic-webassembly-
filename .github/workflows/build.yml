@@ -1,0 +1,65 @@
+name: Build web port
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: 3.1.74
+
+      - name: Get Hatch Game Engine
+        run: git clone --depth 1 https://github.com/HatchGameEngine/HatchGameEngine.git engine
+
+      - name: Apply Emscripten patch
+        run: |
+          cd engine
+          patch -p1 --fuzz=3 < ../hatch-emscripten.patch
+
+      - name: Build (WebAssembly)
+        run: |
+          cd engine
+          emcmake cmake -S . -B build-web \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DEXECUTABLE_NAME=hatch \
+            -DENABLE_USING_LINENOISE=OFF \
+            -DENABLE_VM_DEBUGGING=OFF \
+            -DDEVELOPER_MODE=OFF \
+            -DUSING_OPENGL=OFF \
+            -DUSE_OPEN_ASSET_IMPORT_LIBRARY=OFF
+          cmake --build build-web -j4
+
+      - name: Pack single HTML
+        run: |
+          mkdir site
+          python3 pack.py engine/build-web/hatch.js site/index.html --template index.template.html
+          ls -la site
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
