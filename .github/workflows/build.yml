@@ -20,7 +20,6 @@ jobs:
 
       - name: Check uploaded files
         run: |
-          # Expected sizes: hatch-emscripten.patch ~7123, pack.py ~1741, index.template.html ~10733 bytes
           for f in hatch-emscripten.patch pack.py index.template.html; do
             if [ ! -s "$f" ]; then
               echo "::error::$f is missing or empty - delete it and upload or paste it again"
@@ -42,6 +41,10 @@ jobs:
           patch -p1 --fuzz=3 < ../hatch-emscripten.patch
           test -f cmake/Platforms/Emscripten.cmake || { echo "::error::patch did not create cmake/Platforms/Emscripten.cmake"; exit 1; }
           grep -q __EMSCRIPTEN__ source/Engine/Application.cpp || { echo "::error::patch did not change Application.cpp"; exit 1; }
+          # The Emscripten toolchain restricts find_file() to its own sysroot, so the engine's
+          # platform-file lookup can't see cmake/Platforms. Make it ignore that restriction.
+          sed -i '/find_file(PLATFORM_FILE/ s/NO_DEFAULT_PATH)/NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)/' CMakeLists.txt
+          grep -q NO_CMAKE_FIND_ROOT_PATH CMakeLists.txt || { echo "::error::could not edit CMakeLists.txt"; exit 1; }
 
       - name: Build (WebAssembly)
         run: |
