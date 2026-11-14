@@ -2,6 +2,15 @@ name: Build web port
 
 on:
   workflow_dispatch:
+    inputs:
+      engine_date:
+        description: "Use the engine as it was at this date (UTC). The game was built 2025-02-18."
+        default: "2025-02-18 06:00"
+        required: false
+      engine_sha:
+        description: "Optional exact engine commit (overrides the date)"
+        default: ""
+        required: false
 
 permissions:
   contents: read
@@ -15,54 +24,544 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      ENGINE_DATE: ${{ inputs.engine_date }}
+      ENGINE_SHA: ${{ inputs.engine_sha }}
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check uploaded files
-        run: |
-          for f in hatch-emscripten.patch pack.py index.template.html; do
-            if [ ! -s "$f" ]; then
-              echo "::error::$f is missing or empty - delete it and upload or paste it again"
-              exit 1
-            fi
-            echo "$f: $(wc -c < "$f") bytes"
-          done
-
       - uses: mymindstorm/setup-emsdk@v14
         with:
           version: 3.1.74
 
-      - name: Get Hatch Game Engine
-        run: git clone --depth 1 https://github.com/HatchGameEngine/HatchGameEngine.git engine
-
-      - name: Apply Emscripten patch
+      - name: Get Hatch Game Engine (version matching the game)
         run: |
+          git clone https://github.com/HatchGameEngine/HatchGameEngine.git engine
           cd engine
-          patch -p1 --fuzz=3 < ../hatch-emscripten.patch
-          test -f cmake/Platforms/Emscripten.cmake || { echo "::error::patch did not create cmake/Platforms/Emscripten.cmake"; exit 1; }
-          grep -q __EMSCRIPTEN__ source/Engine/Application.cpp || { echo "::error::patch did not change Application.cpp"; exit 1; }
-          # The Emscripten toolchain restricts find_file() to its own sysroot, so the engine's
-          # platform-file lookup can't see cmake/Platforms. Make it ignore that restriction.
-          sed -i '/find_file(PLATFORM_FILE/ s/NO_DEFAULT_PATH)/NO_DEFAULT_PATH NO_CMAKE_FIND_ROOT_PATH)/' CMakeLists.txt
-          grep -q NO_CMAKE_FIND_ROOT_PATH CMakeLists.txt || { echo "::error::could not edit CMakeLists.txt"; exit 1; }
+          if [ -n "$ENGINE_SHA" ]; then
+            git checkout -q "$ENGINE_SHA"
+          else
+            SHA=$(git rev-list -1 --before="$ENGINE_DATE" HEAD)
+            if [ -z "$SHA" ]; then echo "::error::no engine commit before $ENGINE_DATE"; exit 1; fi
+            git checkout -q "$SHA"
+          fi
+          git log -1 --format='Engine commit: %H (%cI) %s'
+
+      - name: Write web build files
+        run: |
+          mkdir -p webbuild
+          cat > webbuild/CMakeLists.txt <<'HATCH_EOF_0'
+          # Standalone Emscripten build for Hatch Game Engine. Independent of the engine's own
+          # CMake files, so it works on whichever engine version was checked out.
+          cmake_minimum_required(VERSION 3.14)
+          project(HatchWeb C CXX)
+
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED True)
+          if(NOT CMAKE_BUILD_TYPE)
+            set(CMAKE_BUILD_TYPE Release)
+          endif()
+
+          set(ENGINE_DIR "" CACHE PATH "Path to the Hatch Game Engine checkout")
+          if(NOT EXISTS "${ENGINE_DIR}/source/Engine")
+            message(FATAL_ERROR "ENGINE_DIR (${ENGINE_DIR}) does not look like a Hatch checkout")
+          endif()
+
+          file(GLOB_RECURSE ENGINE_C   "${ENGINE_DIR}/source/Engine/*.c")
+          file(GLOB_RECURSE ENGINE_CPP "${ENGINE_DIR}/source/Engine/*.cpp")
+          file(GLOB LIB_C              "${ENGINE_DIR}/source/Libraries/*.c")
+          file(GLOB LIB_CLIPPER        "${ENGINE_DIR}/source/Libraries/Clipper2/clipper.*.cpp")
+          file(GLOB LIB_P2T_COMMON     "${ENGINE_DIR}/source/Libraries/poly2tri/common/*.cpp")
+          file(GLOB LIB_P2T_SWEEP      "${ENGINE_DIR}/source/Libraries/poly2tri/sweep/*.cpp")
+
+          add_executable(hatch ${ENGINE_C} ${ENGINE_CPP} ${LIB_C} ${LIB_CLIPPER} ${LIB_P2T_COMMON} ${LIB_P2T_SWEEP})
+          set_target_properties(hatch PROPERTIES OUTPUT_NAME "hatch" SUFFIX ".js")
+          target_include_directories(hatch PRIVATE "${ENGINE_DIR}/source")
+
+          # Mirrors the engine's own Release configuration, minus desktop-only features
+          # (OpenGL/GLEW, assimp, linenoise, curl): the SDL2 renderer is used, which SDL maps to WebGL.
+          target_compile_definitions(hatch PRIVATE
+            HATCH_WEB
+            USING_VM_FUNCPTRS
+            ALLOW_COMMAND_LINE_RESOURCE_LOAD
+            USE_DEFAULT_FONTS
+            MINIZ_NO_ARCHIVE_APIS
+            MINIZ_NO_ARCHIVE_WRITING_APIS
+            MINIZ_NO_TIME
+            "TARGET_NAME=\"HatchGameEngine\""
+          )
+
+          set(WEB_FLAGS -sUSE_SDL=2 -fwasm-exceptions)
+          target_compile_options(hatch PRIVATE ${WEB_FLAGS} -w)
+          target_link_options(hatch PRIVATE
+            ${WEB_FLAGS}
+            -sALLOW_MEMORY_GROWTH=1
+            -sINITIAL_MEMORY=268435456
+            -sMAXIMUM_MEMORY=2147483648
+            -sSTACK_SIZE=5242880
+            -sFORCE_FILESYSTEM=1
+            -lidbfs.js
+            -sEXPORTED_RUNTIME_METHODS=FS,addRunDependency,removeRunDependency
+            -sSINGLE_FILE=1
+            -sMODULARIZE=1
+            -sEXPORT_NAME=createHatchModule
+            -sENVIRONMENT=web
+            -sEXIT_RUNTIME=0
+          )
+          HATCH_EOF_0
+          cat > webbuild/webpatch.py <<'HATCH_EOF_1'
+          #!/usr/bin/env python3
+          """Make a Hatch Game Engine checkout (any recent version) build for Emscripten.
+
+          Uses regex anchors instead of a fixed diff, so it keeps working when the engine
+          source differs slightly between versions. Essential edits must apply (exit 1
+          otherwise, with diagnostics); optional ones only warn.
+
+          usage: webpatch.py <engine-dir>
+          """
+          import re, sys, pathlib
+
+          root = pathlib.Path(sys.argv[1])
+          eng = root / "source" / "Engine"
+          failed = []
+
+          def read(p):
+              return p.read_text(encoding="utf-8", errors="surrogateescape")
+
+          def write(p, s):
+              p.write_text(s, encoding="utf-8", errors="surrogateescape")
+
+          def edit(rel, label, pattern, repl, essential=True, flags=0, count=1):
+              p = eng / rel
+              if not p.exists():
+                  print(f"[{'FAIL' if essential else 'warn'}] {label}: {rel} not found")
+                  if essential: failed.append(label)
+                  return False
+              s = read(p)
+              if "__EMSCRIPTEN__" in s and label.startswith("(once)"):
+                  return True
+              new, n = re.subn(pattern, repl, s, count=count, flags=flags)
+              if n == 0:
+                  print(f"[{'FAIL' if essential else 'warn'}] {label}: anchor not found in {rel}")
+                  if essential: failed.append(label)
+                  return False
+              write(p, new)
+              print(f"[ ok ] {label}")
+              return True
+
+          # 1. Make the SDL2 include chain accept Emscripten ---------------------------
+          edit("Includes/StandardSDL2.h", "SDL include for Emscripten",
+               r"#elif\s+LINUX\b", "#elif LINUX || defined(__EMSCRIPTEN__)")
+
+          # 2. Application: browser-driven main loop ------------------------------------
+          app_cpp = (eng / "Application.cpp")
+          app_h = (eng / "Application.h")
+          has_ftd = "FrameTimeDesired" in read(app_cpp) if app_cpp.exists() else False
+          desired = "FrameTimeDesired" if has_ftd else "(1000.0 / 60.0)"
+
+          edit("Application.cpp", "emscripten.h include",
+               r"(#include\s*[<\"])", "#ifdef __EMSCRIPTEN__\n#include <emscripten.h>\n#endif\n\\1")
+
+          edit("Application.h", "declare WebMainLoopCallback",
+               r"(static\s+void\s+MainLoop\(\s*\)\s*;)",
+               "\\1\n#ifdef __EMSCRIPTEN__\n\tstatic void WebMainLoopCallback(void* userData);\n#endif")
+
+          callback = f"""#ifdef __EMSCRIPTEN__
+          static double WebFrameAccumulator = 0.0;
+          static double WebLastRAF = 0.0;
+
+          // Called by requestAnimationFrame. Displays refresh at 60/120/144Hz, so only
+          // run a game frame once enough time has built up for one frame at the target
+          // FPS; otherwise the game runs too fast on high-refresh screens.
+          void Application::WebMainLoopCallback(void* userData) {{
+          \tdouble now = Clock::GetTicks();
+          \tdouble elapsed = now - WebLastRAF;
+          \tWebLastRAF = now;
+          \tif (elapsed > {desired} * 4.0) {{
+          \t\telapsed = {desired};
+          \t}}
+          \tWebFrameAccumulator += elapsed;
+          \tif (WebFrameAccumulator < {desired} - 1.5) {{
+          \t\treturn;
+          \t}}
+          \tWebFrameAccumulator -= {desired};
+          \tif (WebFrameAccumulator > {desired}) {{
+          \t\tWebFrameAccumulator = 0.0;
+          \t}}
+          \tif (Running) {{
+          \t\tMainLoop();
+          \t}}
+          \tif (!Running) {{
+          \t\temscripten_cancel_main_loop();
+          \t\tEndGame();
+          \t\tCleanup();
+          \t}}
+          }}
+          #endif
+
+          """
+          edit("Application.cpp", "define WebMainLoopCallback",
+               r"(?m)^(void\s+Application::Run\s*\()", lambda m: callback + m.group(1))
+
+          edit("Application.cpp", "use requestAnimationFrame loop",
+               r"(?s)(\n[ \t]*)(while\s*\(\s*Running\s*\)\s*\{\s*(?:Application::)?MainLoop\(\s*\)\s*;\s*\}\s*(?:Application::)?EndGame\(\s*\)\s*;\s*(?:Application::)?Cleanup\(\s*\)\s*;)",
+               lambda m: ("\n#ifdef __EMSCRIPTEN__\n"
+                          "\tWebFrameAccumulator = 0.0;\n"
+                          "\tWebLastRAF = Clock::GetTicks();\n"
+                          "\temscripten_set_main_loop_arg(WebMainLoopCallback, NULL, 0, 1);\n"
+                          "#else") + m.group(1) + m.group(2) + "\n#endif")
+
+          edit("Application.cpp", "skip busy-wait frame delay",
+               r"(void\s+Application::DelayFrame\(\s*\)\s*\{)",
+               "\\1\n#ifdef __EMSCRIPTEN__\n\treturn;\n#endif", essential=False)
+
+          # 3. Threads: no pthreads in a single-file page, so run inline -----------------
+          edit("Bytecode/StandardLibrary.cpp", "Thread.RunEvent inline",
+               r"SDL_CreateThread\(\s*_Thread_RunEvent\s*,[^;]*;",
+               lambda m: "\n#ifdef __EMSCRIPTEN__\n\t_Thread_RunEvent(bundle);\n#else\n\t" + m.group(0) + "\n#endif\n",
+               essential=False)
+          edit("Bytecode/StandardLibrary.cpp", "HTTP.GetToFile inline",
+               r"SDL_CreateThread\(\s*_HTTP_GetToFile\s*,[^;]*;",
+               lambda m: "\n#ifdef __EMSCRIPTEN__\n\t_HTTP_GetToFile(bundle);\n#else\n\t" + m.group(0) + "\n#endif\n",
+               essential=False)
+
+          # 4. Base path is the root of the virtual filesystem ---------------------------
+          edit("Filesystem/Path.cpp", "base path /",
+               r"(std::string\s+Path::GetBasePath\(\s*\)\s*\{)",
+               "\\1\n#ifdef __EMSCRIPTEN__\n\treturn \"/\";\n#endif", essential=False)
+
+          if failed:
+              print("\nESSENTIAL EDITS FAILED:", ", ".join(failed))
+              for f, pat in (("Application.cpp", r"MainLoop|Running|EndGame|DelayFrame|::Run\("),
+                             ("Application.h", r"MainLoop"),
+                             ("Includes/StandardSDL2.h", r"#(if|elif|else|endif)")):
+                  p = eng / f
+                  if p.exists():
+                      print(f"--- {f}")
+                      for i, line in enumerate(read(p).splitlines(), 1):
+                          if re.search(pat, line):
+                              print(f"{i}: {line}")
+              sys.exit(1)
+          print("webpatch: all essential edits applied")
+          HATCH_EOF_1
+          cat > webbuild/pack.py <<'HATCH_EOF_2'
+          #!/usr/bin/env python3
+          """Inline the Emscripten SINGLE_FILE output (hatch.js, wasm already base64'd inside)
+          into the HTML template, producing one self-contained .html file.
+
+          usage: pack.py <hatch.js> <out.html> [--data Data.hatch]
+
+          --data embeds the game's data pack too. For Sonic Galactic's 255 MB Data.hatch that
+          yields a ~340 MB page which most browsers will choke on; the default (no --data)
+          lets the player pick Data.hatch once and caches it in IndexedDB.
+          """
+          import argparse, base64, pathlib, sys
+
+          ap = argparse.ArgumentParser()
+          ap.add_argument("js"); ap.add_argument("out")
+          ap.add_argument("--data", help="optional Data.hatch to embed (only sensible for small games)")
+          ap.add_argument("--template", default=str(pathlib.Path(__file__).with_name("index.template.html")))
+          a = ap.parse_args()
+
+          tpl = pathlib.Path(a.template).read_text(encoding="utf-8")
+          js = pathlib.Path(a.js).read_text(encoding="utf-8")
+          # Never let the module text terminate the surrounding <script> element.
+          js = js.replace("</script", "<\\/script").replace("<!--", "<\\!--")
+
+          MARK = "/*__HATCH_MODULE_JS__*/"
+          if MARK not in tpl:
+              sys.exit("template is missing the module marker")
+          html = tpl.replace(MARK, js, 1)
+
+          if a.data:
+              raw = pathlib.Path(a.data).read_bytes()
+              b64 = base64.b64encode(raw).decode("ascii")
+              size_mb = len(b64) / 1048576
+              if size_mb > 150:
+                  print(f"warning: embedded data is {size_mb:.0f} MB of base64; many browsers will fail to open this page", file=sys.stderr)
+              embed = '<script>window.__EMBEDDED_DATA_HATCH__="' + b64 + '";</script>\n'
+              html = html.replace("</head>", embed + "</head>", 1)
+
+          out = pathlib.Path(a.out)
+          out.write_text(html, encoding="utf-8")
+          print(f"wrote {out} ({out.stat().st_size/1048576:.1f} MB)")
+          HATCH_EOF_2
+          cat > webbuild/index.template.html <<'HATCH_EOF_3'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+          <title>Sonic Galactic (Hatch Game Engine, WebAssembly)</title>
+          <style>
+          :root { --bg:#0e1116; --fg:#e8ecf2; --muted:#98a2b3; --accent:#4c8dff; --panel:#161b22; --line:#2a313c; }
+          @media (prefers-color-scheme: light) {
+            :root { --bg:#f4f6fa; --fg:#14181f; --muted:#5b6575; --accent:#1f5fe0; --panel:#ffffff; --line:#d5dbe5; }
+          }
+          * { box-sizing: border-box; }
+          html, body { height: 100%; margin: 0; background: var(--bg); color: var(--fg);
+            font: 15px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+          #app { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 12px; }
+          #stage { position: fixed; inset: 0; background: #000; display: none; }
+          #canvas { width: 100%; height: 100%; display: block; outline: none; object-fit: contain; }
+          #panel { width: min(560px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+          h1 { font-size: 20px; margin: 0 0 4px; }
+          p { margin: 8px 0; color: var(--muted); }
+          button, label.btn { appearance: none; border: 0; border-radius: 10px; background: var(--accent); color: #fff;
+            font: inherit; font-weight: 600; padding: 11px 18px; cursor: pointer; display: inline-block; }
+          button.secondary { background: transparent; color: var(--fg); border: 1px solid var(--line); }
+          button[disabled] { opacity: .5; cursor: default; }
+          .row { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+          #bar { height: 8px; background: var(--line); border-radius: 99px; overflow: hidden; margin-top: 14px; display: none; }
+          #bar > i { display: block; height: 100%; width: 0%; background: var(--accent); transition: width .15s; }
+          #status { margin-top: 10px; font-size: 13px; color: var(--muted); min-height: 1.4em; word-break: break-word; }
+          #log { display: none; margin-top: 12px; max-height: 160px; overflow: auto; font: 12px/1.4 ui-monospace, Menlo, Consolas, monospace;
+            background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px; white-space: pre-wrap; }
+          #fs, #logbtn { position: absolute; top: 8px; opacity: 0; transition: opacity .2s; padding: 6px 10px; font-size: 12px;
+            background: rgba(20,24,31,.75); color: #fff; border: 1px solid rgba(255,255,255,.25); }
+          #fs { right: 8px; } #logbtn { right: 100px; }
+          #copylog { position: absolute; top: 8px; right: 168px; opacity: 0; transition: opacity .2s; padding: 6px 10px; font-size: 12px;
+            background: rgba(20,24,31,.75); color: #fff; border: 1px solid rgba(255,255,255,.25); }
+          #stage:hover #fs, #stage:hover #logbtn, #stage:hover #copylog { opacity: .85; }
+          @media (hover: none) { #fs, #logbtn, #copylog { opacity: .85; } }
+          #log.overlay { position: fixed; left: 10px; right: 10px; bottom: 10px; max-height: 40vh; z-index: 10; background: rgba(10,12,16,.92); color: #d7dde8; }
+          input[type=file] { display: none; }
+          </style>
+          </head>
+          <body>
+          <div id="app">
+            <div id="panel">
+              <h1>Sonic Galactic <small style="font-weight:400;color:var(--muted)">· Hatch Game Engine in WebAssembly</small></h1>
+              <p>This page contains the engine only. Pick your own <b>Data.hatch</b> from your copy of the game once; it is kept in this browser (IndexedDB) so you won't need to pick it again.</p>
+              <div class="row">
+                <label class="btn" for="pick">Choose Data.hatch…</label>
+                <input id="pick" type="file" accept=".hatch">
+                <button id="start" disabled>Start</button>
+                <button id="forget" class="secondary" style="display:none">Forget stored data</button>
+              </div>
+              <div id="bar"><i></i></div>
+              <div id="status">Checking for a stored Data.hatch…</div>
+              <div id="log"></div>
+            </div>
+            <div id="stage">
+              <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
+              <button id="copylog" class="secondary">Copy log</button>
+              <button id="logbtn" class="secondary">Log</button>
+              <button id="fs" class="secondary">Fullscreen</button>
+            </div>
+          </div>
+
+          <script>
+          /*__HATCH_MODULE_JS__*/
+          </script>
+
+          <script>
+          (function () {
+            "use strict";
+            var DB_NAME = "hatch-web", STORE = "files", KEY = "Data.hatch";
+            var $ = function (id) { return document.getElementById(id); };
+            var pickEl = $("pick"), startEl = $("start"), forgetEl = $("forget");
+            var statusEl = $("status"), barEl = $("bar"), logEl = $("log");
+            var blob = null, started = false, savingTimer = null;
+
+            function setStatus(t) { statusEl.textContent = t; }
+            var fullLog = "";
+            function appendLog(t) {
+              fullLog += t + "\n";
+              if (fullLog.length > 200000) fullLog = fullLog.slice(-150000);
+              logEl.textContent = fullLog.length > 20000 ? "...\n" + fullLog.slice(-20000) : fullLog;
+              logEl.scrollTop = logEl.scrollHeight;
+              if (!started) logEl.style.display = "block";
+            }
+            function progress(f) { barEl.style.display = "block"; barEl.firstElementChild.style.width = Math.round(f * 100) + "%"; }
+            function mb(n) { return (n / 1048576).toFixed(0) + " MB"; }
+
+            // ---- IndexedDB cache for the user's Data.hatch -------------------------
+            function idb() {
+              return new Promise(function (res, rej) {
+                var r; try { r = indexedDB.open(DB_NAME, 1); } catch (e) { return rej(e); }
+                r.onupgradeneeded = function () { r.result.createObjectStore(STORE); };
+                r.onsuccess = function () { res(r.result); };
+                r.onerror = function () { rej(r.error); };
+              });
+            }
+            function idbGet() {
+              return idb().then(function (db) {
+                return new Promise(function (res, rej) {
+                  var q = db.transaction(STORE).objectStore(STORE).get(KEY);
+                  q.onsuccess = function () { res(q.result || null); };
+                  q.onerror = function () { rej(q.error); };
+                });
+              });
+            }
+            function idbPut(b) {
+              return idb().then(function (db) {
+                return new Promise(function (res, rej) {
+                  var tx = db.transaction(STORE, "readwrite");
+                  tx.objectStore(STORE).put(b, KEY);
+                  tx.oncomplete = function () { res(); };
+                  tx.onerror = function () { rej(tx.error); };
+                  tx.onabort = function () { rej(tx.error); };
+                });
+              });
+            }
+            function idbDelete() {
+              return idb().then(function (db) {
+                return new Promise(function (res, rej) {
+                  var tx = db.transaction(STORE, "readwrite");
+                  tx.objectStore(STORE).delete(KEY);
+                  tx.oncomplete = function () { res(); };
+                  tx.onerror = function () { rej(tx.error); };
+                });
+              });
+            }
+
+            function ready(b, fromCache) {
+              blob = b;
+              startEl.disabled = false;
+              forgetEl.style.display = "inline-block";
+              setStatus((fromCache ? "Stored Data.hatch found" : "Selected") + " (" + mb(b.size) + "). Press Start.");
+            }
+
+            // ---- Boot -------------------------------------------------------------
+            function embeddedBlob() {
+              var b64 = window.__EMBEDDED_DATA_HATCH__;
+              if (!b64) return null;
+              var bin = atob(b64), u8 = new Uint8Array(bin.length);
+              for (var i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+              window.__EMBEDDED_DATA_HATCH__ = null;
+              return new Blob([u8]);
+            }
+            var emb = embeddedBlob();
+            if (emb) {
+              ready(emb, false);
+              setStatus("Game data is embedded in this page (" + mb(emb.size) + "). Press Start.");
+            } else {
+              idbGet().then(function (b) {
+                if (b && b.size > 0) ready(b, true); else setStatus("No stored Data.hatch yet. Choose your file to begin.");
+              }).catch(function () {
+                setStatus("Choose your Data.hatch to begin. (Browser storage unavailable; you'll need to pick it each visit.)");
+              });
+            }
+
+            pickEl.addEventListener("change", function () {
+              var f = pickEl.files && pickEl.files[0];
+              if (!f) return;
+              ready(f, false);
+              idbPut(f).then(function () { setStatus("Selected and stored (" + mb(f.size) + "). Press Start."); },
+                             function () { /* quota or private mode: still usable this session */ });
+            });
+            forgetEl.addEventListener("click", function () {
+              idbDelete().then(function () { blob = null; startEl.disabled = true; forgetEl.style.display = "none"; setStatus("Stored data removed."); });
+            });
+            $("copylog").addEventListener("click", function () {
+              var btn = $("copylog"), txt = fullLog || "(log is empty)";
+              function done(ok) { btn.textContent = ok ? "Copied" : "Copy failed"; setTimeout(function () { btn.textContent = "Copy log"; }, 1500); }
+              try {
+                navigator.clipboard.writeText(txt).then(function () { done(true); }, function () { done(false); });
+              } catch (e) {
+                try {
+                  var ta = document.createElement("textarea"); ta.value = txt; document.body.appendChild(ta);
+                  ta.select(); var ok = document.execCommand("copy"); document.body.removeChild(ta); done(ok);
+                } catch (e2) { done(false); }
+              }
+            });
+            $("logbtn").addEventListener("click", function () {
+              logEl.classList.add("overlay");
+              logEl.style.display = logEl.style.display === "block" ? "none" : "block";
+            });
+            $("fs").addEventListener("click", function () {
+              var s = $("stage"); (s.requestFullscreen || s.webkitRequestFullscreen).call(s);
+            });
+
+            // ---- Read the blob in chunks so we never hold two full copies ----------
+            function readBlob(b) {
+              return new Promise(function (resolve, reject) {
+                var out = new Uint8Array(b.size), off = 0;
+                var reader = b.stream().getReader();
+                (function pump() {
+                  reader.read().then(function (r) {
+                    if (r.done) return resolve(out);
+                    out.set(r.value, off); off += r.value.length;
+                    progress(off / b.size);
+                    pump();
+                  }, reject);
+                })();
+              });
+            }
+
+            var FSRef = null, syncing = false;
+            function persist() {
+              if (!FSRef || syncing) return;
+              syncing = true;
+              try {
+                FSRef.syncfs(false, function (err) { syncing = false; if (err) appendLog("Save sync failed: " + err); });
+              } catch (e) { syncing = false; }
+            }
+
+            startEl.addEventListener("click", function () {
+              if (started || !blob) return;
+              if (typeof createHatchModule !== "function") {
+                setStatus("This page has no engine inside it. Build it with build.sh (see README) so the WebAssembly module gets embedded.");
+                return;
+              }
+              started = true; startEl.disabled = true; pickEl.disabled = true; forgetEl.disabled = true;
+              setStatus("Loading Data.hatch into memory…");
+              readBlob(blob).then(function (bytes) {
+                setStatus("Starting engine…");
+                return createHatchModule({
+                  canvas: $("canvas"),
+                  print: function (t) { console.log(t); appendLog(t); },
+                  printErr: function (t) { console.warn(t); appendLog(t); },
+                  preRun: [function (M) {
+                    var FS = M.FS;
+                    FSRef = FS;
+                    // The engine resolves game://Data.hatch to /Data.hatch.
+                    // canOwn=true keeps the ArrayBuffer as the file's storage (no second copy).
+                    FS.createDataFile("/", "Data.hatch", bytes, true, false, true);
+                    // Persistent settings and saves. The engine writes under $HOME/.local (XDG paths)
+                    // or SDL's pref path (/libsdl); both are backed by IndexedDB.
+                    FS.mkdirTree("/home/web_user/.local");
+                    FS.mount(FS.filesystems.IDBFS, {}, "/home/web_user/.local");
+                    FS.mkdir("/libsdl");
+                    FS.mount(FS.filesystems.IDBFS, {}, "/libsdl");
+                    M.addRunDependency("idbfs-load");
+                    FS.syncfs(true, function (err) {
+                      if (err) appendLog("Could not load saved data: " + err);
+                      M.removeRunDependency("idbfs-load");
+                    });
+                  }],
+                  onAbort: function (what) { appendLog("Engine aborted: " + what); }
+                });
+              }).then(function () {
+                $("panel").style.display = "none";
+                $("stage").style.display = "block";
+                $("canvas").focus();
+                setInterval(persist, 4000);
+                document.addEventListener("visibilitychange", function () { if (document.hidden) persist(); });
+                window.addEventListener("pagehide", persist);
+              }, function (e) {
+                started = false; startEl.disabled = false; pickEl.disabled = false; forgetEl.disabled = false;
+                setStatus("Failed to start: " + (e && e.message || e)); appendLog(String(e && e.stack || e));
+              });
+            });
+          })();
+          </script>
+          </body>
+          </html>
+          HATCH_EOF_3
+          ls -la webbuild
+
+      - name: Patch engine for the browser
+        run: python3 webbuild/webpatch.py engine
 
       - name: Build (WebAssembly)
         run: |
-          cd engine
-          emcmake cmake -S . -B build-web \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DEXECUTABLE_NAME=hatch \
-            -DENABLE_USING_LINENOISE=OFF \
-            -DENABLE_VM_DEBUGGING=OFF \
-            -DDEVELOPER_MODE=OFF \
-            -DUSING_OPENGL=OFF \
-            -DUSE_OPEN_ASSET_IMPORT_LIBRARY=OFF
+          emcmake cmake -S webbuild -B build-web -DENGINE_DIR="$PWD/engine" -DCMAKE_BUILD_TYPE=Release
           cmake --build build-web -j4
 
       - name: Pack single HTML
         run: |
           mkdir site
-          python3 pack.py engine/build-web/hatch.js site/index.html --template index.template.html
+          python3 webbuild/pack.py build-web/hatch.js site/index.html --template webbuild/index.template.html
           ls -la site
 
       - uses: actions/configure-pages@v5
