@@ -45,6 +45,17 @@ jobs:
           fi
           git log -1 --format='Engine commit: %H (%cI) %s'
 
+      - name: Save engine source (for debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: engine-source
+          path: |
+            engine/source
+            engine/CMakeLists.txt
+            engine/Makefile
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Write web build files
         run: |
           mkdir -p webbuild
@@ -106,14 +117,20 @@ jobs:
             -sENVIRONMENT=web
             -sEXIT_RUNTIME=0
           )
+
+          # Set by webpatch.py when the engine's main loop had to be kept as a blocking loop.
+          if(EXISTS "${ENGINE_DIR}/.web_asyncify")
+            message(STATUS "Using ASYNCIFY for the blocking main loop")
+            target_link_options(hatch PRIVATE -sASYNCIFY -sASYNCIFY_STACK_SIZE=65536)
+          endif()
           HATCH_EOF_0
           cat > webbuild/webpatch.py <<'HATCH_EOF_1'
           #!/usr/bin/env python3
           """Make a Hatch Game Engine checkout (any recent version) build for Emscripten.
 
-          Uses regex anchors instead of a fixed diff, so it keeps working when the engine
-          source differs slightly between versions. Essential edits must apply (exit 1
-          otherwise, with diagnostics); optional ones only warn.
+          Uses regex anchors and finds files by name (the source layout moved around
+          between engine versions). Essential edits must apply (exit 1 otherwise, with
+          diagnostics); optional ones only warn.
 
           usage: webpatch.py <engine-dir>
           """
@@ -129,118 +146,133 @@ jobs:
           def write(p, s):
               p.write_text(s, encoding="utf-8", errors="surrogateescape")
 
-          def edit(rel, label, pattern, repl, essential=True, flags=0, count=1):
-              p = eng / rel
-              if not p.exists():
-                  print(f"[{'FAIL' if essential else 'warn'}] {label}: {rel} not found")
+          def find(name):
+              hits = sorted(eng.rglob(name))
+              return hits[0] if hits else None
+
+          def edit(name, label, pattern, repl, essential=True, flags=0, count=1):
+              p = find(name)
+              if p is None:
+                  print(f"[{'FAIL' if essential else 'warn'}] {label}: {name} not found anywhere under source/Engine")
                   if essential: failed.append(label)
                   return False
               s = read(p)
-              if "__EMSCRIPTEN__" in s and label.startswith("(once)"):
-                  return True
               new, n = re.subn(pattern, repl, s, count=count, flags=flags)
               if n == 0:
-                  print(f"[{'FAIL' if essential else 'warn'}] {label}: anchor not found in {rel}")
+                  print(f"[{'FAIL' if essential else 'warn'}] {label}: anchor not found in {p.relative_to(root)}")
                   if essential: failed.append(label)
                   return False
               write(p, new)
-              print(f"[ ok ] {label}")
+              print(f"[ ok ] {label}  ({p.relative_to(root)})")
               return True
 
-          # 1. Make the SDL2 include chain accept Emscripten ---------------------------
-          edit("Includes/StandardSDL2.h", "SDL include for Emscripten",
-               r"#elif\s+LINUX\b", "#elif LINUX || defined(__EMSCRIPTEN__)")
+          # 1. SDL include chain must accept Emscripten ---------------------------------
+          edit("StandardSDL2.h", "SDL include for Emscripten", r"#elif\s+LINUX\b", "#elif LINUX || defined(__EMSCRIPTEN__)")
 
-          # 2. Application: browser-driven main loop ------------------------------------
-          app_cpp = (eng / "Application.cpp")
-          app_h = (eng / "Application.h")
-          has_ftd = "FrameTimeDesired" in read(app_cpp) if app_cpp.exists() else False
-          desired = "FrameTimeDesired" if has_ftd else "(1000.0 / 60.0)"
+          # 2. Application: let the browser drive the main loop -------------------------
+          app = find("Application.cpp")
+          if app is None:
+              print("[FAIL] Application.cpp not found"); sys.exit(1)
+          src = read(app)
+          desired = "FrameTimeDesired" if "FrameTimeDesired" in src else "(1000.0 / 60.0)"
 
           edit("Application.cpp", "emscripten.h include",
                r"(#include\s*[<\"])", "#ifdef __EMSCRIPTEN__\n#include <emscripten.h>\n#endif\n\\1")
 
-          edit("Application.h", "declare WebMainLoopCallback",
-               r"(static\s+void\s+MainLoop\(\s*\)\s*;)",
-               "\\1\n#ifdef __EMSCRIPTEN__\n\tstatic void WebMainLoopCallback(void* userData);\n#endif")
+          edit("Application.cpp", "frame pacing state",
+               r"(?m)^(void\s+Application::Run\s*\()",
+               lambda m: "#ifdef __EMSCRIPTEN__\nstatic double WebFrameAccumulator = 0.0;\nstatic double WebLastRAF = 0.0;\n#endif\n\n" + m.group(1))
 
-          callback = f"""#ifdef __EMSCRIPTEN__
-          static double WebFrameAccumulator = 0.0;
-          static double WebLastRAF = 0.0;
+          src = read(app)
+          loop_a = re.compile(r"(?s)(\n[ \t]*)(while\s*\(\s*Running\s*\)\s*\{\s*(?:Application::)?MainLoop\(\s*\)\s*;\s*\}\s*(?:Application::)?EndGame\(\s*\)\s*;\s*(?:Application::)?Cleanup\(\s*\)\s*;)")
 
-          // Called by requestAnimationFrame. Displays refresh at 60/120/144Hz, so only
-          // run a game frame once enough time has built up for one frame at the target
-          // FPS; otherwise the game runs too fast on high-refresh screens.
-          void Application::WebMainLoopCallback(void* userData) {{
-          \tdouble now = Clock::GetTicks();
-          \tdouble elapsed = now - WebLastRAF;
-          \tWebLastRAF = now;
-          \tif (elapsed > {desired} * 4.0) {{
-          \t\telapsed = {desired};
-          \t}}
-          \tWebFrameAccumulator += elapsed;
-          \tif (WebFrameAccumulator < {desired} - 1.5) {{
-          \t\treturn;
-          \t}}
-          \tWebFrameAccumulator -= {desired};
-          \tif (WebFrameAccumulator > {desired}) {{
-          \t\tWebFrameAccumulator = 0.0;
-          \t}}
-          \tif (Running) {{
-          \t\tMainLoop();
-          \t}}
-          \tif (!Running) {{
-          \t\temscripten_cancel_main_loop();
-          \t\tEndGame();
-          \t\tCleanup();
-          \t}}
-          }}
-          #endif
+          web_loop = f"""
+          #ifdef __EMSCRIPTEN__
+          \tWebFrameAccumulator = 0.0;
+          \tWebLastRAF = Clock::GetTicks();
+          \t// requestAnimationFrame drives the loop. Displays run at 60/120/144Hz, so only
+          \t// run a game frame once enough time has built up for one frame at the target FPS.
+          \temscripten_set_main_loop_arg([](void*) {{
+          \t\tdouble now = Clock::GetTicks();
+          \t\tdouble elapsed = now - WebLastRAF;
+          \t\tWebLastRAF = now;
+          \t\tif (elapsed > {desired} * 4.0) {{
+          \t\t\telapsed = {desired};
+          \t\t}}
+          \t\tWebFrameAccumulator += elapsed;
+          \t\tif (WebFrameAccumulator < {desired} - 1.5) {{
+          \t\t\treturn;
+          \t\t}}
+          \t\tWebFrameAccumulator -= {desired};
+          \t\tif (WebFrameAccumulator > {desired}) {{
+          \t\t\tWebFrameAccumulator = 0.0;
+          \t\t}}
+          \t\tif (Application::Running) {{
+          \t\t\tApplication::MainLoop();
+          \t\t}}
+          \t\tif (!Application::Running) {{
+          \t\t\temscripten_cancel_main_loop();
+          \t\t\tApplication::EndGame();
+          \t\t\tApplication::Cleanup();
+          \t\t}}
+          \t}}, NULL, 0, 1);
+          #else"""
 
-          """
-          edit("Application.cpp", "define WebMainLoopCallback",
-               r"(?m)^(void\s+Application::Run\s*\()", lambda m: callback + m.group(1))
+          mode = None
+          if loop_a.search(src):
+              write(app, loop_a.sub(lambda m: web_loop + m.group(1) + m.group(2) + "\n#endif", src, count=1))
+              print("[ ok ] main loop -> requestAnimationFrame (MainLoop() style)")
+              mode = "raf"
+          else:
+              # Older engines run the whole frame inline in Run(). Keep that loop as it is and
+              # yield to the browser once per frame with ASYNCIFY instead.
+              m = re.search(r"(?m)^([ \t]*)(?:Application::)?DelayFrame\(\s*\)\s*;", src)
+              if m:
+                  pace = (f"#ifdef __EMSCRIPTEN__\n"
+                          f"{m.group(1)}{{\n"
+                          f"{m.group(1)}\tstatic double webLastFrame = Clock::GetTicks();\n"
+                          f"{m.group(1)}\tdouble webNow;\n"
+                          f"{m.group(1)}\tdo {{\n"
+                          f"{m.group(1)}\t\temscripten_sleep(1);\n"
+                          f"{m.group(1)}\t\twebNow = Clock::GetTicks();\n"
+                          f"{m.group(1)}\t}} while (webNow - webLastFrame < {desired} - 1.0);\n"
+                          f"{m.group(1)}\twebLastFrame = webNow;\n"
+                          f"{m.group(1)}}}\n"
+                          f"#else\n{m.group(0)}\n#endif")
+                  write(app, src[:m.start()] + pace + src[m.end():])
+                  (root / ".web_asyncify").write_text("1")
+                  print("[ ok ] main loop kept inline; yielding to the browser each frame (ASYNCIFY mode)")
+                  mode = "asyncify"
+              else:
+                  print("[FAIL] could not find the main loop in Application.cpp")
+                  failed.append("main loop")
 
-          edit("Application.cpp", "use requestAnimationFrame loop",
-               r"(?s)(\n[ \t]*)(while\s*\(\s*Running\s*\)\s*\{\s*(?:Application::)?MainLoop\(\s*\)\s*;\s*\}\s*(?:Application::)?EndGame\(\s*\)\s*;\s*(?:Application::)?Cleanup\(\s*\)\s*;)",
-               lambda m: ("\n#ifdef __EMSCRIPTEN__\n"
-                          "\tWebFrameAccumulator = 0.0;\n"
-                          "\tWebLastRAF = Clock::GetTicks();\n"
-                          "\temscripten_set_main_loop_arg(WebMainLoopCallback, NULL, 0, 1);\n"
-                          "#else") + m.group(1) + m.group(2) + "\n#endif")
-
-          edit("Application.cpp", "skip busy-wait frame delay",
-               r"(void\s+Application::DelayFrame\(\s*\)\s*\{)",
-               "\\1\n#ifdef __EMSCRIPTEN__\n\treturn;\n#endif", essential=False)
-
-          # 3. Threads: no pthreads in a single-file page, so run inline -----------------
-          edit("Bytecode/StandardLibrary.cpp", "Thread.RunEvent inline",
+          # 3. Threads: no pthreads in a single-file page, so run inline ------------------
+          edit("StandardLibrary.cpp", "Thread.RunEvent inline",
                r"SDL_CreateThread\(\s*_Thread_RunEvent\s*,[^;]*;",
                lambda m: "\n#ifdef __EMSCRIPTEN__\n\t_Thread_RunEvent(bundle);\n#else\n\t" + m.group(0) + "\n#endif\n",
                essential=False)
-          edit("Bytecode/StandardLibrary.cpp", "HTTP.GetToFile inline",
+          edit("StandardLibrary.cpp", "HTTP.GetToFile inline",
                r"SDL_CreateThread\(\s*_HTTP_GetToFile\s*,[^;]*;",
                lambda m: "\n#ifdef __EMSCRIPTEN__\n\t_HTTP_GetToFile(bundle);\n#else\n\t" + m.group(0) + "\n#endif\n",
                essential=False)
 
-          # 4. Base path is the root of the virtual filesystem ---------------------------
-          edit("Filesystem/Path.cpp", "base path /",
+          # 4. Base path is the root of the virtual filesystem -----------------------------
+          edit("Path.cpp", "base path /",
                r"(std::string\s+Path::GetBasePath\(\s*\)\s*\{)",
                "\\1\n#ifdef __EMSCRIPTEN__\n\treturn \"/\";\n#endif", essential=False)
 
           if failed:
               print("\nESSENTIAL EDITS FAILED:", ", ".join(failed))
-              for f, pat in (("Application.cpp", r"MainLoop|Running|EndGame|DelayFrame|::Run\("),
-                             ("Application.h", r"MainLoop"),
-                             ("Includes/StandardSDL2.h", r"#(if|elif|else|endif)")):
-                  p = eng / f
-                  if p.exists():
-                      print(f"--- {f}")
-                      for i, line in enumerate(read(p).splitlines(), 1):
-                          if re.search(pat, line):
-                              print(f"{i}: {line}")
+              print("--- engine/source/Engine top level:")
+              print("  " + "  ".join(sorted(x.name for x in eng.iterdir()))[:1500])
+              p = find("Application.cpp")
+              print(f"--- {p.relative_to(root)} (loop-related lines)")
+              for i, line in enumerate(read(p).splitlines(), 1):
+                  if re.search(r"MainLoop|Running|EndGame|DelayFrame|::Run\(|Cleanup", line):
+                      print(f"{i}: {line}")
               sys.exit(1)
-          print("webpatch: all essential edits applied")
+          print(f"webpatch: all essential edits applied (mode: {mode})")
           HATCH_EOF_1
           cat > webbuild/pack.py <<'HATCH_EOF_2'
           #!/usr/bin/env python3
