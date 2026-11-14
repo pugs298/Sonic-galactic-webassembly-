@@ -45,6 +45,16 @@ jobs:
           fi
           git log -1 --format='Engine commit: %H (%cI) %s'
 
+      - name: Inspect engine layout
+        run: |
+          echo "== top level of the engine checkout"; ls engine | tr '\n' ' '; echo
+          echo "== where is Application.h?"; find engine -path engine/.git -prune -o -name 'Application.h' -print
+          echo "== how many .h / .cpp files"; echo "h: $(find engine -path engine/.git -prune -o -name '*.h' -print | wc -l)  cpp: $(find engine -path engine/.git -prune -o -name '*.cpp' -print | wc -l)"
+          echo "== source/Engine (first 45 entries)"; ls engine/source/Engine | head -45 | tr '\n' ' '; echo
+          echo "== other top-level source dirs"; ls engine/source | tr '\n' ' '; echo
+          echo "== header generators mentioned"; grep -rIl -i "makeheaders" engine --exclude-dir=.git 2>/dev/null | head -5
+          echo "== tools"; ls engine/tools 2>/dev/null | tr '\n' ' '; echo
+
       - name: Save engine source (for debugging)
         uses: actions/upload-artifact@v4
         with:
@@ -78,14 +88,28 @@ jobs:
 
           file(GLOB_RECURSE ENGINE_C   "${ENGINE_DIR}/source/Engine/*.c")
           file(GLOB_RECURSE ENGINE_CPP "${ENGINE_DIR}/source/Engine/*.cpp")
+          file(GLOB TOP_CPP            "${ENGINE_DIR}/source/*.cpp")
           file(GLOB LIB_C              "${ENGINE_DIR}/source/Libraries/*.c")
           file(GLOB LIB_CLIPPER        "${ENGINE_DIR}/source/Libraries/Clipper2/clipper.*.cpp")
           file(GLOB LIB_P2T_COMMON     "${ENGINE_DIR}/source/Libraries/poly2tri/common/*.cpp")
           file(GLOB LIB_P2T_SWEEP      "${ENGINE_DIR}/source/Libraries/poly2tri/sweep/*.cpp")
 
-          add_executable(hatch ${ENGINE_C} ${ENGINE_CPP} ${LIB_C} ${LIB_CLIPPER} ${LIB_P2T_COMMON} ${LIB_P2T_SWEEP})
+          add_executable(hatch ${ENGINE_C} ${ENGINE_CPP} ${TOP_CPP} ${LIB_C} ${LIB_CLIPPER} ${LIB_P2T_COMMON} ${LIB_P2T_SWEEP})
           set_target_properties(hatch PROPERTIES OUTPUT_NAME "hatch" SUFFIX ".js")
-          target_include_directories(hatch PRIVATE "${ENGINE_DIR}/source")
+          # Older engine versions keep their headers in a different folder than newer ones, so find
+          # whichever directory holds Engine/Application.h and use it as an include root.
+          file(GLOB_RECURSE HDR_CANDIDATES "${ENGINE_DIR}/*Application.h")
+          set(HDR_ROOTS "")
+          foreach(h ${HDR_CANDIDATES})
+            if(h MATCHES "^(.*)/Engine/Application\\.h$")
+              list(APPEND HDR_ROOTS "${CMAKE_MATCH_1}")
+            endif()
+          endforeach()
+          if(HDR_ROOTS)
+            list(REMOVE_DUPLICATES HDR_ROOTS)
+          endif()
+          message(STATUS "Header roots found: ${HDR_ROOTS}")
+          target_include_directories(hatch PRIVATE ${HDR_ROOTS} "${ENGINE_DIR}/source")
 
           # Mirrors the engine's own Release configuration, minus desktop-only features
           # (OpenGL/GLEW, assimp, linenoise, curl): the SDL2 renderer is used, which SDL maps to WebGL.
@@ -586,9 +610,19 @@ jobs:
         run: python3 webbuild/webpatch.py engine
 
       - name: Build (WebAssembly)
+        shell: bash
         run: |
-          emcmake cmake -S webbuild -B build-web -DENGINE_DIR="$PWD/engine" -DCMAKE_BUILD_TYPE=Release
-          cmake --build build-web -j4
+          emcmake cmake -S webbuild -B build-web -DENGINE_DIR="$PWD/engine" -DCMAKE_BUILD_TYPE=Release 2>&1 | tee configure.log
+          # -k keeps going after an error so one run reports every problem
+          cmake --build build-web -j4 -- -k 2>&1 | tee build.log
+
+      - name: Summary of build errors
+        if: always()
+        run: |
+          echo "== header roots:"; grep "Header roots" configure.log || true
+          echo "== distinct errors (count, message):"
+          grep -E "error:|undefined symbol|duplicate symbol|wasm-ld:" build.log | sed -E 's#/home/runner/work/[^/]+/[^/]+/(engine/)?##g' | cut -c1-170 | sort | uniq -c | sort -rn | head -40
+          echo "== files with errors:"; grep -E "error:" build.log | sed -E 's#/home/runner/work/[^/]+/[^/]+/(engine/)?##; s#:[0-9]+:[0-9]+:.*##' | sort | uniq -c | sort -rn | head -15
 
       - name: Pack single HTML
         run: |
