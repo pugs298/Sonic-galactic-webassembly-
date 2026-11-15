@@ -54,6 +54,8 @@ jobs:
           echo "== other top-level source dirs"; ls engine/source | tr '\n' ' '; echo
           echo "== header generators mentioned"; grep -rIl -i "makeheaders" engine --exclude-dir=.git 2>/dev/null | head -5
           echo "== tools"; ls engine/tools 2>/dev/null | tr '\n' ' '; echo
+          L=$(grep -n '^void Application::Run' engine/source/Engine/Application.cpp | head -1 | cut -d: -f1)
+          echo "== Application::Run starts at line $L"; sed -n "$L,$((L+90))p" engine/source/Engine/Application.cpp
 
       - name: Save engine source (for debugging)
         uses: actions/upload-artifact@v4
@@ -124,7 +126,14 @@ jobs:
             "TARGET_NAME=\"HatchGameEngine\""
           )
 
-          set(WEB_FLAGS -sUSE_SDL=2 -fwasm-exceptions)
+          # ASYNCIFY (used when the engine's main loop is a blocking loop) cannot process wasm-native
+          # exceptions, so use JavaScript-based C++ exceptions in that mode.
+          if(EXISTS "${ENGINE_DIR}/.web_asyncify")
+            set(EXC_FLAG -fexceptions)
+          else()
+            set(EXC_FLAG -fwasm-exceptions)
+          endif()
+          set(WEB_FLAGS -sUSE_SDL=2 ${EXC_FLAG})
           target_compile_options(hatch PRIVATE ${WEB_FLAGS} -w)
           target_link_options(hatch PRIVATE
             ${WEB_FLAGS}
